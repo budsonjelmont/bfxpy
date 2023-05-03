@@ -10,6 +10,20 @@ import re
 #import vcf
 #from vcf import utils
 
+# Implode columns prefixed 'INFO*' into a single INFO column
+def implode_info_col(df):
+  infocols = list(df.columns[((df.columns.str.startswith('INFO')) & (df.columns!='INFO'))])
+  df['INFO'] = df.apply(lambda x: ';'.join([y[4:] + '=' + str(x[y]) for y in infocols if ~pd.isna(x[y]) and x[y] is not None]),axis=1)
+  return df
+
+# Implode columns prefixed 'FORMAT*' into a single INFO column
+def implode_fmt_col(df, *sample_data_cols):
+  fmtcols = list(df.columns[((df.columns.str.startswith('FORMAT')) & (df.columns!='FORMAT'))])
+  for s in sample_data_cols:
+    df['FORMAT'] = df.apply(lambda x: ':'.join([y[6:] for y in fmtcols if ~pd.isna(x[y]) and x[y] is not None]),axis=1)
+    df[s] = df.apply(lambda x: ':'.join([str(x[y]) for y in fmtcols if ~pd.isna(x[y]) and x[y] is not None]),axis=1)
+  return df
+
 # Explode INFO columns into multiple columns named, e.g. 'INFODP', 'INFOFS', etc.
 def explode_info_col(df):
   info_srs = df['INFO'].apply(lambda x: pd.DataFrame([{'INFO' + y.split('=')[0]:y.split('=')[1] for y in x.split(';')}]))
@@ -59,26 +73,24 @@ def vcf_to_df(vcffile, *sample_data_cols, explode_fmt=False, explode_info=False)
   return df
 
 # Wrangle pandas dataframe into a consistent format
-def preprocess_df(df,samplename):
+def preprocess_df(df, implode_fmt=False, implode_info=False, explode_fmt=False, explode_info=False, samplename='SAMPLE_DATA'):
     df.columns = df.columns.str.upper().str.replace('([FORMAT|INFO])_','\\1',regex=True)
-    df.sort_values(['CHROM','POS','ID'],inplace=True)
+    df = df.sort_values(['CHROM','POS','ID'])
     # Standardize data type
     df['CHROM'] = df['CHROM'].astype(str)
     df['POS'] = df['POS'].astype(int)
-    # Gather up INFO and FORMAT columns
-    if 'INFO' not in df.columns:
+    if implode_info:
+      df = implode_info_col(df)
       infocols = list(df.columns[((df.columns.str.startswith('INFO')) & (df.columns!='INFO'))])
       df['INFO'] = df.apply(lambda x: ';'.join([y[4:] + '=' + str(x[y]) for y in infocols if ~pd.isna(x[y]) and x[y] is not None]),axis=1)
-
-    if 'FORMAT' not in df.columns or samplename not in df.columns:
-      fmtcols = list(df.columns[((df.columns.str.startswith('FORMAT')) & (df.columns!='FORMAT'))])
-      if 'FORMAT' not in df.columns:
-        df['FORMAT'] = df.apply(lambda x: ':'.join([y[6:] for y in fmtcols if ~pd.isna(x[y]) and x[y] is not None]),axis=1)
-      if samplename not in df.columns:
-        df[samplename] = df.apply(lambda x: ':'.join([str(x[y]) for y in fmtcols if ~pd.isna(x[y]) and x[y] is not None]),axis=1)
-
+    if implode_fmt:
+      df = implode_fmt_col(df, samplename)
+    if explode_info:
+      df = explode_info_col(df)
+    if explode_fmt:
+       df = explode_fmt_col(df, samplename)
     # Add missing columns & fill nulls with default values
-    optional_cols = {'FILTER':'PASS','QUAL':'.','INFO':'.','FORMAT':'.',samplename:'.'}
+    optional_cols = {'FILTER':'PASS','QUAL':'.','INFO':'.','FORMAT':'.',samplename:'.', 'ALT2':'.'}
     missing_cols = optional_cols.keys() - set(df.columns)
     for col in missing_cols:
         df[col] = optional_cols[col]
@@ -86,14 +98,15 @@ def preprocess_df(df,samplename):
     df.fillna(optional_cols,inplace=True)
     # Combine ALT1 & 2 into single field if there isn't already an ALT column defined
     if 'ALT' not in df.columns:
-      df['ALT'] = df.apply(lambda x: ','.join([y for y in x[['ALT1','ALT2']] if ~pd.isna(y) and y is not None]),axis=1) 
+        df['ALT2'] = df['ALT2'].replace({np.nan: None, '.': None,'': None, 'nan': None})
+        df['ALT'] = df.apply(lambda x: ','.join([y for y in x[['ALT1','ALT2']] if ~pd.isna(y) and y is not None]),axis=1) 
     return df
 
 # Chromosome sizes file generated using UCSC tools here https://hgdownload.cse.ucsc.edu/admin/exe/linux.x86_64/
 # Example command:
 # fetchChromSizes hg19 > hg19.chrom.sizes
-def df_to_vcf(df, chr_size_file, output_file, build='GRCh38', source='df_to_vcf', samplename='SAMPLE_DATA'):
-    df = preprocess_df(df,samplename)
+def df_to_vcf(df, chr_size_file, output_file, build='GRCh38', source='df_to_vcf', samplename='SAMPLE_DATA', implode_info=False, implode_fmt=False, explode_info=False, explode_fmt=False): 
+    df = preprocess_df(df, samplename=samplename, implode_info=implode_info, implode_fmt=implode_fmt, explode_info=explode_info, explode_fmt=explode_fmt)
 
     header = OrderedDict()
     header['fileformat'] = 'VCFv4.2'
@@ -211,5 +224,10 @@ def df_to_pyvcf(df, l_trim=True, r_trim=True):
       print(df)
     return df.apply(lambda x: vcf.model._Record(x['CHR'], x['POS'], x['id'], x['REF'], [vcfreader._parse_alt(x['ALT'])], x['QUAL'], x['FILTER'], vcfreader._parse_info(x['INFO']), None, sample_indexes=None, samples=None), axis=1).values.tolist()
 
-def df_to_jsonvcf(df, explode_info=True, explode_fmt=True, strip_non_alphanum=True):
+def df_to_jsonvcf(df, explode_info=True, explode_fmt=True, strip_non_alphanum=True, *sample_data_cols):
+  if explode_info:
+    df = explode_info_col(df)
+  if explode_fmt:
+     df = explode_fmt_col(df, *sample_data_cols)
+  df = df.replace({np.nan: None})
   return df.to_dict(orient='records')
